@@ -16,6 +16,7 @@
    This simulates A4 paper in a browser. Under print mode, this fits the print page.
    ========================================================================== */
 .cv-preview-sheet {
+  position: relative;
   box-sizing: border-box;
   background-color: #ffffff;
   color: #1e293b;

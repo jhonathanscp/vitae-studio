@@ -16,8 +16,7 @@ import { enrichedCVSchema } from "../../http/schema/task.schema";
 import { logger } from "../../../util/logger";
 import {
     cleanJobDescription,
-    extractJobKeywords,
-    calculateDynamicMaxTokens
+    extractJobKeywords
 } from "../ats/text-sanitizer";
 import {
     ATS_SYSTEM_PROMPT_EN,
@@ -52,6 +51,63 @@ function buildAuthHeaders(apiKey?: string): Record<string, string> {
     return headers;
 }
 
+export function isReasoningModelName(model: string): boolean {
+    return /(?:reason|r1|think|flash|qwq|(?:^|[/:_-])o[134](?:$|[/:_-])|gemini-2\.5|gemini-3)/i.test(model);
+}
+
+export const REASONING_MODEL_MAX_TOKENS = 20480;
+export const STANDARD_MODEL_MAX_TOKENS = 8192;
+const MAX_TOKENS_FALLBACK_TIERS = [16384, 8192, 4096] as const;
+const REASONING_COMPLETION_TIMEOUT_MS = 240000;
+const STANDARD_COMPLETION_TIMEOUT_MS = 120000;
+
+export function getCompletionMaxTokens(model: string): number {
+    return isReasoningModelName(model)
+        ? REASONING_MODEL_MAX_TOKENS
+        : STANDARD_MODEL_MAX_TOKENS;
+}
+
+function getCompletionTimeoutMs(model: string): number {
+    return isReasoningModelName(model)
+        ? REASONING_COMPLETION_TIMEOUT_MS
+        : STANDARD_COMPLETION_TIMEOUT_MS;
+}
+
+export function resolveFallbackMaxTokens(currentMaxTokens: number, errorDetail: string): number | null {
+    const rangeMatch = errorDetail.match(
+        /(?:\[\s*\d+\s*(?:,|\.\.)\s*|between\s+\d+\s+and\s+)(\d{3,6})/i
+    );
+    const limitMatch = errorDetail.match(
+        /(?:at most|maximum(?:\s+allowed)?(?:\s+value)?(?:\s+of|\s+is)?|<=|cannot exceed|exceeds(?:\s+the)?(?:\s+maximum|\s+limit)?(?:\s+of)?|less than or equal to|greater than|\d+\s*\)?\s*>\s*)\s*(\d{3,6})/i
+    );
+
+    const rawParsed = rangeMatch?.[1] ?? limitMatch?.[1];
+    if (rawParsed) {
+        const parsedLimit = Number.parseInt(rawParsed, 10);
+        if (Number.isFinite(parsedLimit) && parsedLimit >= 1024 && parsedLimit < currentMaxTokens) {
+            return parsedLimit;
+        }
+    }
+
+    const nextTier = MAX_TOKENS_FALLBACK_TIERS.find(tier => tier < currentMaxTokens);
+    return nextTier ?? null;
+}
+
+function isMaxTokens400Error(err: unknown): { matched: boolean; detail: string } {
+    if (!isAxiosError(err) || err.response?.status !== 400) {
+        return { matched: false, detail: "" };
+    }
+
+    const detail = extractAxiosErrorDetail(err);
+    const param = (err.response?.data as any)?.error?.param;
+    const matched =
+        param === "max_tokens" ||
+        param === "max_completion_tokens" ||
+        /max_(?:tokens|output_tokens|completion_tokens)|completion tokens|in the completion/i.test(detail);
+
+    return { matched, detail };
+}
+
 export function extractRawContentFromChoice(choice: any): string | null {
     if (!choice) return null;
 
@@ -77,6 +133,72 @@ export function extractRawContentFromChoice(choice: any): string | null {
     return null;
 }
 
+function hasPrimaryChoiceContent(choice: any): boolean {
+    return (
+        (typeof choice?.message?.content === "string" && choice.message.content.trim().length > 0) ||
+        (typeof choice?.text === "string" && choice.text.trim().length > 0)
+    );
+}
+
+function resolveChoiceContent(params: {
+    choice: any;
+    usage: any;
+    maxTokens: number;
+    logTag: string;
+    emptyErrorMessage: string;
+}): { data: string; err?: undefined } | { err: GeminiInvalidResponseError; data?: undefined } {
+    const { choice, usage, maxTokens, logTag, emptyErrorMessage } = params;
+    const finishReason = choice?.finish_reason;
+    const rawContent = extractRawContentFromChoice(choice);
+    const primaryPresent = hasPrimaryChoiceContent(choice);
+    const completionTokens = usage?.completion_tokens;
+
+    if (finishReason === "length") {
+        if (!primaryPresent) {
+            logger.warn(
+                { choice, usage },
+                `${logTag} Token limit reached during reasoning before generating JSON content`
+            );
+            return {
+                err: new GeminiInvalidResponseError(
+                    `O modelo de IA esgotou o limite de tokens (${completionTokens || maxTokens} tokens) durante o raciocínio antes de gerar o conteúdo JSON. Recomendamos utilizar o modelo 'deepseek-chat' (DeepSeek V3) para geração direta e rápida sem gasto excessivo com thinking.`
+                )
+            };
+        }
+
+        logger.warn(
+            { finishReason, completionTokens, tail: rawContent?.slice(-120) },
+            `${logTag} Response was truncated at token limit`
+        );
+        return {
+            err: new GeminiInvalidResponseError(
+                `A resposta da IA foi cortada ao atingir o limite de tokens (${completionTokens || maxTokens} tokens). Recomendamos utilizar o modelo 'deepseek-chat' para geração completa sem cortes.`
+            )
+        };
+    }
+
+    if (!rawContent) {
+        logger.warn({ choice, usage }, `${logTag} Empty choice received`);
+        return {
+            err: new GeminiInvalidResponseError(emptyErrorMessage)
+        };
+    }
+
+    if (!primaryPresent && !rawContent.includes("{")) {
+        logger.warn(
+            { choice, usage, preview: rawContent.slice(0, 200) },
+            `${logTag} Provider returned reasoning-only prose without JSON object`
+        );
+        return {
+            err: new GeminiInvalidResponseError(
+                `O modelo de IA retornou apenas texto de raciocínio sem gerar o JSON final (${completionTokens || maxTokens} tokens). Tente novamente ou utilize o modelo 'deepseek-chat'.`
+            )
+        };
+    }
+
+    return { data: rawContent };
+}
+
 export function stripTechQuotes(text: string): string {
     if (!text) return "";
     return text
@@ -87,9 +209,66 @@ export function stripTechQuotes(text: string): string {
 export function stripBulletPrefixes(desc: string): string {
     if (!desc) return "";
     return desc.replace(
-        /^([•\-\*]\s*)(?!(?:Desenvolvi|Implementei|Estruturei|Automatizei|Otimizei|Liderei|Criei|Arquitetei|Construí|Modelei|Integrei|Reduzi|Gerenciei|Refatorei)\b)[A-ZÀ-Ú][A-Za-zÀ-Ú0-9\s\/\-]{2,28}:\s+(?=[A-ZÀ-Ú])/gm,
+        /^([•\-\*]\s*)(?!(?:Desenvolvi|Implementei|Estruturei|Automatizei|Otimizei|Liderei|Criei|Arquitetei|Construí|Modelei|Integrei|Reduzi|Gerenciei|Refatorei|Atuei|Conduzi|Diagnostiquei|Prestei|Solucionei|Documentei|Registrei|Apoiei|Coordenei|Monitorei|Administrei|Analisei|Propus)\b)[A-ZÀ-Ú][A-Za-zÀ-Ú0-9\s\/\-]{2,28}:\s+(?=[A-ZÀ-Ú])/gm,
         "$1"
     );
+}
+
+function findLastBalancedJsonObject(text: string): unknown | undefined {
+    const spans: Array<[number, number]> = [];
+    let inString = false;
+    let isEscaped = false;
+    let depth = 0;
+    let startIdx = -1;
+
+    for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+
+        if (inString) {
+            if (isEscaped) {
+                isEscaped = false;
+            } else if (char === "\\") {
+                isEscaped = true;
+            } else if (char === "\"") {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (char === "\"") {
+            inString = true;
+        } else if (char === "{") {
+            if (depth === 0) {
+                startIdx = i;
+            }
+            depth++;
+        } else if (char === "}") {
+            if (depth > 0) {
+                depth--;
+                if (depth === 0 && startIdx !== -1) {
+                    spans.push([startIdx, i + 1]);
+                    startIdx = -1;
+                }
+            }
+        }
+    }
+
+    for (let i = spans.length - 1; i >= 0; i--) {
+        const [start, end] = spans[i];
+        const candidate = text.slice(start, end);
+        for (const attempt of [candidate, candidate.replace(/,\s*([}\]])/g, "$1")]) {
+            try {
+                const parsed = JSON.parse(attempt);
+                if (parsed !== null && typeof parsed === "object") {
+                    return parsed;
+                }
+            } catch {
+                // Continue trying earlier balanced JSON candidates
+            }
+        }
+    }
+
+    return undefined;
 }
 
 export function extractJsonFromText(
@@ -129,7 +308,22 @@ export function extractJsonFromText(
     try {
         return JSON.parse(noTrailingCommas);
     } catch (_) {
-        // Continue to character-stream repair
+        // Continue to balanced object scan & character-stream repair
+    }
+
+    const lastBalanced = findLastBalancedJsonObject(cleaned);
+    if (lastBalanced !== undefined) {
+        return lastBalanced;
+    }
+
+    if (!noTrailingCommas.includes("{") && !noTrailingCommas.includes("[")) {
+        logger.warn(
+            { original: rawText.slice(0, 300) },
+            "[extractJsonFromText] No JSON braces/brackets found in model response"
+        );
+        throw new GeminiInvalidResponseError(
+            "A IA retornou uma resposta em texto sem objeto JSON válido. Tente novamente ou selecione o modelo 'deepseek-chat'."
+        );
     }
 
     // 3. Resilient repair of unescaped quotes, unescaped newlines/tabs, and truncation
@@ -504,28 +698,63 @@ async function postToChatEndpointWithFormatFallback(
     headers: Record<string, string>,
     timeoutMs: number
 ) {
-    try {
-        return await axios.post(targetUrl, payload, { headers, timeout: timeoutMs });
-    } catch (err: unknown) {
-        if (isAxiosError(err) && err.response?.status === 400 && "response_format" in payload) {
-            const { response_format: _ignored, ...payloadWithoutFormat } = payload;
-            return await axios.post(targetUrl, payloadWithoutFormat, { headers, timeout: timeoutMs });
+    let currentPayload: Record<string, unknown> = { ...payload };
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+        try {
+            return await axios.post(targetUrl, currentPayload, { headers, timeout: timeoutMs });
+        } catch (err: unknown) {
+            if (!isAxiosError(err) || err.response?.status !== 400) {
+                throw err;
+            }
+
+            const maxTokensCheck = isMaxTokens400Error(err);
+            if (maxTokensCheck.matched && typeof currentPayload.max_tokens === "number") {
+                const nextMaxTokens = resolveFallbackMaxTokens(
+                    currentPayload.max_tokens,
+                    maxTokensCheck.detail
+                );
+                if (nextMaxTokens !== null) {
+                    logger.warn(
+                        {
+                            previousMaxTokens: currentPayload.max_tokens,
+                            fallbackMaxTokens: nextMaxTokens,
+                            detail: maxTokensCheck.detail
+                        },
+                        "[OpenAI-Compatible] Provider rejected max_tokens; retrying with lower limit"
+                    );
+                    currentPayload = { ...currentPayload, max_tokens: nextMaxTokens };
+                    continue;
+                }
+            }
+
+            if ("response_format" in currentPayload) {
+                const { response_format: _ignored, ...payloadWithoutFormat } = currentPayload;
+                currentPayload = payloadWithoutFormat;
+                continue;
+            }
+
+            throw err;
         }
-        throw err;
     }
+
+    return await axios.post(targetUrl, currentPayload, { headers, timeout: timeoutMs });
 }
 
 export function applyAtsDiffsToCV(
     cv: CVData,
-    diffs: Array<{ id: string; improved: string }>,
+    diffs: Array<{ id: string; improved: string | string[] }>,
     targetRole?: string,
     extractedKeywords?: string[]
 ): Omit<CVData, "style"> {
     const diffMap = new Map<string, string>();
     if (Array.isArray(diffs)) {
         for (const d of diffs) {
-            if (d && d.id && typeof d.improved === "string" && d.improved.trim()) {
-                diffMap.set(String(d.id), d.improved.trim());
+            if (d && d.id) {
+                const normalized = normalizeTailoredText(d.improved, "", false);
+                if (normalized) {
+                    diffMap.set(String(d.id), normalized);
+                }
             }
         }
     }
@@ -653,25 +882,31 @@ export async function enrichCVWithOpenAICompatible(params: {
 
     const targetRole = cv.personal.title || "Especialista";
     const userPrompt = buildAtsUserPrompt(targetRole, keywords, itemsToOptimize);
-    const maxTokens = calculateDynamicMaxTokens(itemsToOptimize.length);
+    const maxTokens = getCompletionMaxTokens(model);
+    const timeoutMs = getCompletionTimeoutMs(model);
 
     try {
-        const response = await postChatCompletionsWithFallback(baseUrl, apiKey, {
-            model: model.trim(),
-            messages: [
-                {
-                    role: "system",
-                    content: ATS_SYSTEM_PROMPT_EN
-                },
-                {
-                    role: "user",
-                    content: userPrompt
-                }
-            ],
-            temperature: 0.25,
-            max_tokens: maxTokens,
-            response_format: { type: "json_object" }
-        });
+        const response = await postChatCompletionsWithFallback(
+            baseUrl,
+            apiKey,
+            {
+                model: model.trim(),
+                messages: [
+                    {
+                        role: "system",
+                        content: ATS_SYSTEM_PROMPT_EN
+                    },
+                    {
+                        role: "user",
+                        content: userPrompt
+                    }
+                ],
+                temperature: 0.25,
+                max_tokens: maxTokens,
+                response_format: { type: "json_object" }
+            },
+            timeoutMs
+        );
 
         const usage = response.data?.usage;
         if (usage) {
@@ -687,16 +922,19 @@ export async function enrichCVWithOpenAICompatible(params: {
         }
 
         const choice = response.data?.choices?.[0];
-        const rawContent = extractRawContentFromChoice(choice);
+        const resolved = resolveChoiceContent({
+            choice,
+            usage,
+            maxTokens,
+            logTag: "[OpenAI-Compatible ATS Enrichment]",
+            emptyErrorMessage: "O provedor de IA retornou uma resposta vazia ou em formato inesperado."
+        });
 
-        if (!rawContent) {
-            logger.warn({ choice, usage: response.data?.usage }, "[OpenAI-Compatible ATS Enrichment] Empty choice received");
-            return {
-                err: new GeminiInvalidResponseError("O provedor de IA retornou uma resposta vazia ou em formato inesperado.")
-            };
+        if (resolved.err) {
+            return { err: resolved.err };
         }
 
-        const parsed = extractJsonFromText(rawContent) as any;
+        const parsed = extractJsonFromText(resolved.data, { rejectTruncated: true }) as any;
 
         // Se o retorno for no formato moderno de Diffs:
         if (parsed && Array.isArray(parsed.diffs)) {
@@ -728,23 +966,31 @@ export async function extractCVFromTextWithOpenAICompatible(params: {
         return { err: new ConfigurationError("O modelo de IA não foi configurado.") };
     }
 
+    const maxTokens = getCompletionMaxTokens(model);
+    const timeoutMs = getCompletionTimeoutMs(model);
+
     try {
-        const response = await postChatCompletionsWithFallback(baseUrl, apiKey, {
-            model: model.trim(),
-            messages: [
-                {
-                    role: "system",
-                    content: RESUME_EXTRACTION_SYSTEM_PROMPT_EN
-                },
-                {
-                    role: "user",
-                    content: buildResumeExtractionUserPayload(rawResumeText)
-                }
-            ],
-            temperature: 0.1,
-            max_tokens: 4000,
-            response_format: { type: "json_object" }
-        });
+        const response = await postChatCompletionsWithFallback(
+            baseUrl,
+            apiKey,
+            {
+                model: model.trim(),
+                messages: [
+                    {
+                        role: "system",
+                        content: RESUME_EXTRACTION_SYSTEM_PROMPT_EN
+                    },
+                    {
+                        role: "user",
+                        content: buildResumeExtractionUserPayload(rawResumeText)
+                    }
+                ],
+                temperature: 0.1,
+                max_tokens: maxTokens,
+                response_format: { type: "json_object" }
+            },
+            timeoutMs
+        );
 
         const usage = response.data?.usage;
         if (usage) {
@@ -760,16 +1006,19 @@ export async function extractCVFromTextWithOpenAICompatible(params: {
         }
 
         const choice = response.data?.choices?.[0];
-        const rawContent = extractRawContentFromChoice(choice);
+        const resolved = resolveChoiceContent({
+            choice,
+            usage,
+            maxTokens,
+            logTag: "[OpenAI-Compatible Extraction]",
+            emptyErrorMessage: "O provedor de IA retornou uma resposta vazia ou em formato inesperado durante a extração do currículo."
+        });
 
-        if (!rawContent) {
-            logger.warn({ choice, usage: response.data?.usage }, "[OpenAI-Compatible Extraction] Empty choice received");
-            return {
-                err: new GeminiInvalidResponseError("O provedor de IA retornou uma resposta vazia ou em formato inesperado durante a extração do currículo.")
-            };
+        if (resolved.err) {
+            return { err: resolved.err };
         }
 
-        const parsed = extractJsonFromText(rawContent);
+        const parsed = extractJsonFromText(resolved.data, { rejectTruncated: true });
         const validatedCV = normalizeExtractedCV(parsed);
 
         return { data: validatedCV };
@@ -804,6 +1053,14 @@ export function normalizeCuratedResult(
     originalCv: CVData,
     job: JobCurationInput
 ): TargetedCuration {
+    // Log interno de diagnóstico do bloco _ats_mapping e remoção imediata antes de salvar/retornar
+    if (raw?._ats_mapping && typeof raw._ats_mapping === "object") {
+        logger.debug(
+            { atsMapping: raw._ats_mapping },
+            "[ATS Curation] Internal _ats_mapping plan captured (stripped from persisted TargetedCuration)"
+        );
+    }
+
     const matchScore = typeof raw?.matchScore === "number" && !isNaN(raw.matchScore)
         ? Math.min(100, Math.max(0, Math.round(raw.matchScore)))
         : 80;
@@ -816,15 +1073,17 @@ export function normalizeCuratedResult(
         ? raw.missingKeywords.map((k: unknown) => stripTechQuotes(String(k || "").trim())).filter(Boolean)
         : [];
 
-    const tailoredTitle = typeof raw?.tailoredTitle === "string" && raw.tailoredTitle.trim()
-        ? stripTechQuotes(raw.tailoredTitle.trim())
+    const rawTitle = raw?.tailoredTitle ?? raw?.personal?.title;
+    const tailoredTitle = typeof rawTitle === "string" && rawTitle.trim()
+        ? stripTechQuotes(rawTitle.trim())
         : undefined;
 
-    const tailoredObjective = typeof raw?.tailoredObjective === "string" && raw.tailoredObjective.trim()
-        ? stripTechQuotes(raw.tailoredObjective.trim())
+    const rawObjective = raw?.tailoredObjective ?? raw?.objective;
+    const tailoredObjective = typeof rawObjective === "string" && rawObjective.trim()
+        ? stripTechQuotes(rawObjective.trim())
         : originalCv.objective;
 
-    // Experience curation (suporta chave 'experienceCuration' ou 'experience', e lookup por ID ou índice)
+    // Experience curation (suporta chave 'experienceCuration' ou 'experience', lookup por ID, empresa ou índice)
     const expMap: Record<string, ItemCuration> = {};
     const rawExpList = Array.isArray(raw?.experienceCuration)
         ? raw.experienceCuration
@@ -840,7 +1099,7 @@ export function normalizeCuratedResult(
 
     originalCv.experience.forEach((exp, idx) => {
         let found = rawExpLookup.get(exp.id);
-        if (!found && rawExpList.length > 0 && rawExpList[idx]) {
+        if (!found && rawExpList.length > 0) {
             const candidateByCompany = exp.company
                 ? rawExpList.find((it: any) =>
                     typeof it?.company === "string" &&
@@ -865,7 +1124,7 @@ export function normalizeCuratedResult(
         }
     });
 
-    // Project curation (suporta 'projectCuration' ou 'projects')
+    // Project curation (suporta 'projectCuration' ou 'projects', lookup por ID, nome ou índice)
     const projMap: Record<string, ItemCuration> = {};
     const rawProjList = Array.isArray(raw?.projectCuration)
         ? raw.projectCuration
@@ -881,20 +1140,26 @@ export function normalizeCuratedResult(
 
     (originalCv.projects || []).forEach((proj, idx) => {
         let found = rawProjLookup.get(proj.id);
-        if (!found && rawProjList.length > 0 && rawProjList.length === (originalCv.projects || []).length) {
-            found = rawProjList[idx];
+        if (!found && rawProjList.length > 0) {
+            const candidateByName = proj.name
+                ? rawProjList.find((it: any) =>
+                    typeof it?.name === "string" &&
+                    it.name.trim().toLowerCase() === proj.name.trim().toLowerCase()
+                )
+                : undefined;
+            found = candidateByName || (rawProjList.length === (originalCv.projects || []).length ? rawProjList[idx] : undefined);
         }
 
         if (found) {
             projMap[proj.id] = {
                 included: found.included !== undefined ? Boolean(found.included) : idx < 2,
-                relevanceScore: typeof found.relevanceScore === "number" ? found.relevanceScore : (idx === 0 ? 90 : 50),
+                relevanceScore: typeof found.relevanceScore === "number" ? found.relevanceScore : (idx < 2 ? 85 : 50),
                 tailoredDescription: normalizeTailoredText(found.tailoredDescription ?? found.description, proj.description, false)
             };
         } else {
             projMap[proj.id] = {
-                included: idx === 0,
-                relevanceScore: idx === 0 ? 80 : 40,
+                included: idx < 2,
+                relevanceScore: idx < 2 ? 75 : 40,
                 tailoredDescription: proj.description
             };
         }
@@ -944,12 +1209,18 @@ export function normalizeCuratedResult(
         };
     });
 
-    // Selected skills (máx 12 inicialmente, poda pode reduzir para 8-10 se necessário)
-    const rawSkills = Array.isArray(raw?.selectedSkills)
-        ? raw.selectedSkills.map((s: unknown) => stripTechQuotes(String(s || "").trim())).filter(Boolean)
+    // Selected skills (12 a 16 competências ordenadas por aderência)
+    const rawSkillsSource = Array.isArray(raw?.selectedSkills)
+        ? raw.selectedSkills
+        : Array.isArray(raw?.skills)
+        ? raw.skills
         : [];
-    const selectedSkills = rawSkills.length > 0 ? rawSkills.slice(0, 12) : originalCv.skills.slice(0, 10);
+    const rawSkills = rawSkillsSource
+        .map((s: unknown) => stripTechQuotes(String(s || "").trim()))
+        .filter(Boolean);
+    const selectedSkills = rawSkills.length > 0 ? rawSkills.slice(0, 16) : originalCv.skills.slice(0, 14);
 
+    // Objeto limpo sem _ats_mapping
     const rawResult: TargetedCuration = {
         jobTitle: job.roleTitle,
         company: job.company,
@@ -965,17 +1236,16 @@ export function normalizeCuratedResult(
         selectedSkills
     };
 
-    // Aplica o Algoritmo Determinístico de Poda Progressiva (Camada B) para garantia física de 1 página A4
-    const { curation: prunedCuration, estimatedHeight, prunedLevelsApplied } = pruneCurationToFitA4(originalCv, rawResult);
+    // Equilíbrio visual de 1 página A4 (85%-95%) e poda progressiva apenas se > 98%
+    const { curation: balancedCuration, estimatedHeight, fillPercentage, prunedLevelsApplied, spacing } =
+        pruneCurationToFitA4(originalCv, rawResult);
 
-    if (prunedLevelsApplied.length > 0) {
-        logger.info(
-            { estimatedHeight, prunedLevelsApplied },
-            "[A4 Density Pruner] Curation pruned to fit strictly on 1 A4 page"
-        );
-    }
+    logger.info(
+        { estimatedHeight, fillPercentage, spacing, prunedLevelsApplied },
+        "[A4 Density Balance] Curated resume calibrated for 1-page A4"
+    );
 
-    return prunedCuration;
+    return balancedCuration;
 }
 
 export async function curateCVWithOpenAICompatible(params: {
@@ -995,35 +1265,41 @@ export async function curateCVWithOpenAICompatible(params: {
         return { err: new ConfigurationError("O modelo de IA não foi configurado.") };
     }
 
+    // Descrição integral da vaga (sem pré-cortes), mantendo higienização de HTML
     const sanitizedJob: JobCurationInput = {
         ...job,
-        jobDescription: cleanJobDescription(job.jobDescription)
+        jobDescription: cleanJobDescription(job.jobDescription, Infinity)
     };
 
     const userPrompt = buildCurationUserPayload(cv, sanitizedJob);
 
-    // Calibração segura de max_tokens: modelos padrão consomem ~600-900 tokens (teto 1400);
-    // modelos com thinking/reasoning recebem 4096 tokens para não truncar o JSON no meio.
-    const isReasoningModel = /reason|r1|think|flash/i.test(model);
-    const maxTokens = isReasoningModel ? 4096 : 1400;
+    // Orçamento de tokens: 8192 para modelos padrão (ex: deepseek-chat) e 20480 (~20k) para modelos reasoning/flash
+    // que consomem tokens internos em reasoning_content antes de escrever o JSON
+    const maxTokens = getCompletionMaxTokens(model);
+    const timeoutMs = getCompletionTimeoutMs(model);
 
     try {
-        const response = await postChatCompletionsWithFallback(baseUrl, apiKey, {
-            model: model.trim(),
-            messages: [
-                {
-                    role: "system",
-                    content: CURATION_SYSTEM_PROMPT_EN
-                },
-                {
-                    role: "user",
-                    content: userPrompt
-                }
-            ],
-            temperature: 0.25,
-            max_tokens: maxTokens,
-            response_format: { type: "json_object" }
-        });
+        const response = await postChatCompletionsWithFallback(
+            baseUrl,
+            apiKey,
+            {
+                model: model.trim(),
+                messages: [
+                    {
+                        role: "system",
+                        content: CURATION_SYSTEM_PROMPT_EN
+                    },
+                    {
+                        role: "user",
+                        content: userPrompt
+                    }
+                ],
+                temperature: 0.3,
+                max_tokens: maxTokens,
+                response_format: { type: "json_object" }
+            },
+            timeoutMs
+        );
 
         const usage = response.data?.usage;
         if (usage) {
@@ -1039,44 +1315,26 @@ export async function curateCVWithOpenAICompatible(params: {
         }
 
         const choice = response.data?.choices?.[0];
-        const finishReason = choice?.finish_reason;
-        const rawContent = extractRawContentFromChoice(choice);
+        const resolved = resolveChoiceContent({
+            choice,
+            usage,
+            maxTokens,
+            logTag: "[OpenAI-Compatible Curation]",
+            emptyErrorMessage: "O provedor de IA retornou uma resposta vazia durante a curadoria da vaga."
+        });
 
-        if (!rawContent) {
-            const completionTokens = usage?.completion_tokens;
-
-            logger.warn(
-                { choice, usage },
-                "[OpenAI-Compatible Curation] Provider returned empty message content"
-            );
-
-            if (finishReason === "length") {
-                return {
-                    err: new GeminiInvalidResponseError(
-                        `O modelo de IA esgotou o limite de tokens (${completionTokens || maxTokens} tokens) durante o raciocínio antes de gerar o conteúdo JSON. Recomendamos utilizar o modelo 'deepseek-chat' (DeepSeek V3) para curadoria direta e ultra rápida sem gasto excessivo com thinking.`
-                    )
-                };
-            }
-
-            return {
-                err: new GeminiInvalidResponseError("O provedor de IA retornou uma resposta vazia durante a curadoria da vaga.")
-            };
+        if (resolved.err) {
+            return { err: resolved.err };
         }
 
-        // Impede que respostas cortadas no meio (ex: "...automações e") sejam aceitas como válidas
-        if (finishReason === "length") {
-            logger.warn(
-                { finishReason, completionTokens: usage?.completion_tokens, tail: rawContent.slice(-120) },
-                "[OpenAI-Compatible Curation] Response was truncated at token limit"
-            );
-            return {
-                err: new GeminiInvalidResponseError(
-                    `A resposta da IA foi cortada ao atingir o limite de tokens (${usage?.completion_tokens || maxTokens} tokens). Recomendamos utilizar o modelo 'deepseek-chat' para geração completa sem cortes.`
-                )
-            };
-        }
+        const parsed = extractJsonFromText(resolved.data, { rejectTruncated: true }) as any;
 
-        const parsed = extractJsonFromText(rawContent, { rejectTruncated: true }) as any;
+        if (parsed && parsed._ats_mapping) {
+            logger.info(
+                { atsMapping: parsed._ats_mapping },
+                "[OpenAI-Compatible Curation] Extracted _ats_mapping plan (will be stripped before saving)"
+            );
+        }
 
         const returnedExpList = Array.isArray(parsed?.experienceCuration)
             ? parsed.experienceCuration

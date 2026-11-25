@@ -12,7 +12,9 @@ interface CVPreviewProps {
   data: CVData;
 }
 
-const A4_SAFE_HEIGHT_PX = 1100; // 297mm = 1122px a 96 DPI (deixa ~5.5mm de margem de segurança contra spillover)
+const A4_SHEET_HEIGHT_PX = 1122; // 297mm a 96 DPI
+const A4_MIN_FILL_HEIGHT_PX = 920; // 82% de preenchimento mínimo recomendado
+const A4_SAFE_HEIGHT_PX = 1100; // 98% de altura útil (margem anti-quebra para página 2)
 
 export default function CVPreview({ data }: CVPreviewProps) {
   const { personal, objective, experience, education, projects, certificates, skills, languages, style } = data;
@@ -20,6 +22,12 @@ export default function CVPreview({ data }: CVPreviewProps) {
   const sheetRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
   const [sheetHeight, setSheetHeight] = useState(A4_SAFE_HEIGHT_PX);
+  const [autoRelaxed, setAutoRelaxed] = useState(false);
+
+  // Reseta ajuste automático sempre que o conteúdo/estilo do CV mudar
+  useEffect(() => {
+    setAutoRelaxed(false);
+  }, [data]);
 
   useEffect(() => {
     const updateScaleAndHeight = () => {
@@ -32,12 +40,26 @@ export default function CVPreview({ data }: CVPreviewProps) {
       }
 
       if (sheetRef.current) {
-        setSheetHeight(sheetRef.current.scrollHeight);
+        const sheetEl = sheetRef.current;
+        const lastChild = sheetEl.lastElementChild as HTMLElement | null;
+        const contentBottom = lastChild ? lastChild.offsetTop + lastChild.offsetHeight + 45 : 0;
+        const measuredHeight =
+          sheetEl.scrollHeight > A4_SHEET_HEIGHT_PX + 2
+            ? sheetEl.scrollHeight
+            : Math.max(contentBottom, 200);
+
+        setSheetHeight(measuredHeight);
+
+        if (!autoRelaxed && style.spacing === 'normal' && measuredHeight < A4_MIN_FILL_HEIGHT_PX) {
+          setAutoRelaxed(true);
+        } else if (autoRelaxed && measuredHeight > A4_SAFE_HEIGHT_PX) {
+          setAutoRelaxed(false);
+        }
       }
     };
 
     updateScaleAndHeight();
-    
+
     const observer = new ResizeObserver(updateScaleAndHeight);
     if (containerRef.current) {
       observer.observe(containerRef.current);
@@ -49,7 +71,7 @@ export default function CVPreview({ data }: CVPreviewProps) {
     return () => {
       observer.disconnect();
     };
-  }, [data]);
+  }, [data, autoRelaxed, style.spacing]);
 
   // Get font family class name
   const getFontClass = () => {
@@ -62,35 +84,43 @@ export default function CVPreview({ data }: CVPreviewProps) {
     }
   };
 
-  // Inline CSS variables derived from style settings
+  // Inline CSS variables derived from style settings + equilíbrio automático (< 82% A4)
   interface PreviewStyle extends CSSProperties {
     '--preview-accent'?: string;
     '--preview-spacing-multiplier'?: string;
     '--preview-line-height'?: string;
   }
 
+  const effectiveSpacing =
+    style.spacing === 'compact'
+      ? 'compact'
+      : style.spacing === 'relaxed' || autoRelaxed
+      ? 'relaxed'
+      : 'normal';
+
   const previewStyle: PreviewStyle = {
     '--preview-accent': style.accentColor,
-    '--preview-spacing-multiplier': style.spacing === 'compact' ? '0.72' : style.spacing === 'relaxed' ? '1.3' : '1.0',
-    '--preview-line-height': style.spacing === 'compact' ? '1.33' : style.spacing === 'relaxed' ? '1.5' : '1.42',
+    '--preview-spacing-multiplier': effectiveSpacing === 'compact' ? '0.72' : effectiveSpacing === 'relaxed' ? '1.3' : '1.0',
+    '--preview-line-height': effectiveSpacing === 'compact' ? '1.33' : effectiveSpacing === 'relaxed' ? '1.48' : '1.42',
   };
 
   const isOverflowing = sheetHeight > A4_SAFE_HEIGHT_PX;
+  const fillPercent = Math.min(100, Math.round((sheetHeight / A4_SHEET_HEIGHT_PX) * 100));
 
   return (
     <main className="cv-preview-container" ref={containerRef}>
       <div className="cv-preview-wrapper">
         <div className={`a4-page-indicator no-print ${isOverflowing ? 'overflow' : 'perfect'}`}>
           {isOverflowing ? (
-            <span>⚠️ Atenção: Conteúdo ultrapassou 1 folha A4 ({sheetHeight}px / {A4_SAFE_HEIGHT_PX}px). Desative algum item para manter o padrão de 1 página.</span>
+            <span>⚠️ Atenção: Conteúdo ultrapassou 98% da folha A4 ({sheetHeight}px / {A4_SAFE_HEIGHT_PX}px). Desative algum item para manter 1 página.</span>
           ) : (
-            <span>✓ Encaixe Perfeito: 1 Folha A4 ({sheetHeight}px / {A4_SAFE_HEIGHT_PX}px)</span>
+            <span>✓ Encaixe Perfeito: 1 Folha A4 ({fillPercent}% preenchido · {sheetHeight}px / {A4_SAFE_HEIGHT_PX}px)</span>
           )}
         </div>
 
-        <div 
+        <div
           ref={sheetRef}
-          className={`cv-preview-sheet ${getFontClass()} theme-${style.theme}`} 
+          className={`cv-preview-sheet ${getFontClass()} theme-${style.theme}`}
           style={{
             ...previewStyle,
             transform: `scale(${scale})`,

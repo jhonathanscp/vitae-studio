@@ -144,16 +144,68 @@ const extensiveMasterProfile: CVData = {
 };
 
 describe("A4 Density Pruner & 1-Page Physical Guarantee", () => {
-    it("validates CURATION_SYSTEM_PROMPT_EN contains first-person singular voice, dynamic title, no-quotes rule and smart consolidation", () => {
+    it("validates CURATION_SYSTEM_PROMPT_EN contains _ats_mapping, De-Para translation, first-person voice, consistency, no-quotes rule and depth budget", () => {
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("_ats_mapping");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("target_role_core_duties");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("exact_ats_keywords");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("de_para_strategy");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("space_allocation_plan");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("Semantic \"De-Para\" Translation Engine");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("First-Person Singular Active Voice");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("FIRST PERSON SINGULAR");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("STRICT NO-QUOTES RULE");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("STRICT INTERNAL CONSISTENCY RULE");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("Desenvolvi");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("Estruturei");
-        expect(CURATION_SYSTEM_PROMPT_EN).toContain("420-480 characters");
+        expect(CURATION_SYSTEM_PROMPT_EN).toContain("450-550 characters");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("Mandatory Experience Rewriting & Smart Consolidation");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("Strict Anti-Hallucination");
         expect(CURATION_SYSTEM_PROMPT_EN).toContain("Strict 1-Page A4 Budget");
+    });
+
+    it("rebalances short underfilled CVs (< 82%) to include relevant items or relaxed spacing without exceeding 98%", () => {
+        const shortCuration: TargetedCuration = {
+            jobTitle: "Backend Developer",
+            company: "Tech",
+            matchScore: 85,
+            matchedKeywords: ["Node.js", "TypeScript"],
+            missingKeywords: [],
+            tailoredTitle: "Desenvolvedor Backend | Node.js & TypeScript",
+            tailoredObjective: "Sou desenvolvedor backend com experiência prática em Node.js e TypeScript construindo APIs seguras e escaláveis para produtos digitais.",
+            experience: {
+                "exp-1": {
+                    included: true,
+                    relevanceScore: 95,
+                    tailoredDescription: "• Desenvolvi APIs em Node.js e TypeScript garantindo alta disponibilidade em produção.\n• Estruturei pipelines de CI/CD automatizados."
+                },
+                "exp-2": { included: false, relevanceScore: 70, tailoredDescription: "• Implementei serviços com filas e mensageria." },
+                "exp-3": { included: false, relevanceScore: 30, tailoredDescription: "• Suporte legado." },
+                "exp-4": { included: false, relevanceScore: 20, tailoredDescription: "• Sites." }
+            },
+            projects: {
+                "proj-1": { included: true, relevanceScore: 90, tailoredDescription: "• Arquitetei engine de mensageria em TypeScript e Redis." },
+                "proj-2": { included: false, relevanceScore: 80, tailoredDescription: "• Criei CLI para migração de schemas PostgreSQL." },
+                "proj-3": { included: false, relevanceScore: 30, tailoredDescription: "• Portfólio." }
+            },
+            education: {
+                "edu-1": { included: true, relevanceScore: 95 },
+                "edu-2": { included: false, relevanceScore: 70 }
+            },
+            certificates: {
+                "cert-1": { included: false, relevanceScore: 90 },
+                "cert-2": { included: false, relevanceScore: 85 },
+                "cert-3": { included: false, relevanceScore: 40 },
+                "cert-4": { included: false, relevanceScore: 20 }
+            },
+            selectedSkills: ["Node.js", "TypeScript", "PostgreSQL", "Docker", "Redis", "CI/CD", "TDD", "Microsserviços", "AWS", "Kafka", "Git", "APIs REST"]
+        };
+
+        const result = pruneCurationToFitA4(extensiveMasterProfile, shortCuration);
+        expect(result.prunedLevelsApplied).toEqual([]);
+        expect(result.estimatedHeight).toBeLessThanOrEqual(A4_MAX_HEIGHT_PX);
+        // Deve ter re-incluído o 2º projeto e certificados para preencher >= 82% harmoniosamente
+        expect(result.curation.projects["proj-2"].included).toBe(true);
+        expect(result.curation.certificates["cert-1"].included).toBe(true);
     });
 
     it("detects overflow on an unpruned extensive profile with all items enabled", () => {

@@ -27,8 +27,9 @@ const STOP_WORDS = new Set([
 /**
  * Remove HTML tags, scripts, estilos, comentários e ruídos de marcação.
  * Converte HTML bruto do LinkedIn em texto limpo e conciso.
+ * @param maxChars Limite opcional de caracteres (padrão 4000; passe Infinity para descrição integral sem pré-cortes).
  */
-export function cleanJobDescription(rawHtmlOrText: string): string {
+export function cleanJobDescription(rawHtmlOrText: string, maxChars = 4000): string {
     if (!rawHtmlOrText || typeof rawHtmlOrText !== "string") {
         return "";
     }
@@ -69,11 +70,8 @@ export function cleanJobDescription(rawHtmlOrText: string): string {
         .filter(line => line.length > 0)
         .join("\n");
 
-    // Limita o tamanho máximo de segurança (evita estourar contexto mesmo com descrições gigantes)
-    // 4.000 caracteres de texto puro representam ~800 tokens, mais que suficiente para descrever qualquer vaga
-    const MAX_JOB_TEXT_CHARS = 4000;
-    if (text.length > MAX_JOB_TEXT_CHARS) {
-        text = text.slice(0, MAX_JOB_TEXT_CHARS) + "\n[Texto da vaga truncado para síntese de requisitos]";
+    if (Number.isFinite(maxChars) && maxChars > 0 && text.length > maxChars) {
+        text = text.slice(0, maxChars) + "\n[Texto da vaga truncado para síntese de requisitos]";
     }
 
     return text.trim();

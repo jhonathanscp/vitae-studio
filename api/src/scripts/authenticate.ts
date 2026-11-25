@@ -12,7 +12,13 @@ import { LINKEDIN_LOGIN_PAGE } from "../util/constants"
  */
 export async function authenticate() {
     const browser = await puppeteer.launch({
-        headless: false
+        headless: false,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage"
+        ]
     })
 
     const page = await browser.newPage()

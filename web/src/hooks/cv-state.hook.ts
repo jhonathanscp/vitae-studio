@@ -86,7 +86,7 @@ export function deriveTargetedCV(
     languages: master.languages,
     style: {
       ...master.style,
-      spacing: spacing === 'compact' ? 'compact' : master.style?.spacing || 'normal'
+      spacing
     }
   };
 }

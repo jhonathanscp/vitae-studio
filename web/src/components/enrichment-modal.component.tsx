@@ -12,6 +12,24 @@ interface EnrichmentModalProps {
     onOpenSettings?: () => void
 }
 
+function extractLinkedinJobId(input: string): string | null {
+    const trimmed = input.trim()
+    if (!trimmed) return null
+    if (/^\d+$/.test(trimmed)) return trimmed
+
+    const currentJobMatch = trimmed.match(/[?&]currentJobId=(\d+)/i)
+    if (currentJobMatch && currentJobMatch[1]) {
+        return currentJobMatch[1]
+    }
+
+    const viewMatch = trimmed.match(/linkedin\.com\/(?:comm\/)?jobs\/view\/(?:[^/?#]*-)?(\d+)/i)
+    if (viewMatch && viewMatch[1]) {
+        return viewMatch[1]
+    }
+
+    return null
+}
+
 export default function EnrichmentModal({
     isOpen,
     onClose,
@@ -59,16 +77,10 @@ export default function EnrichmentModal({
             return
         }
 
-        // Valida se é numérico ou se o usuário colou a URL inteira
-        let jobId = trimmedId
-        if (trimmedId.includes("linkedin.com/jobs/view/")) {
-            const matches = trimmedId.match(/view\/(\d+)/)
-            if (matches && matches[1]) {
-                jobId = matches[1]
-            } else {
-                setValidationError("Formato de URL do LinkedIn inválido. Forneça o ID numérico ou o link direto da vaga.")
-                return
-            }
+        const jobId = extractLinkedinJobId(trimmedId)
+        if (!jobId) {
+            setValidationError("Formato de URL do LinkedIn inválido. Forneça o ID numérico ou o link da vaga.")
+            return
         }
 
         startEnrichment(jobId, cvData)
@@ -82,7 +94,7 @@ export default function EnrichmentModal({
                 style: cvData.style
             }
             onApplyEnrichment(completeCv, {
-                jobId: linkedinJobId.trim(),
+                jobId: extractLinkedinJobId(linkedinJobId) || linkedinJobId.trim(),
                 roleTitle: enrichedCV.personal.title,
                 company: "LinkedIn"
             })

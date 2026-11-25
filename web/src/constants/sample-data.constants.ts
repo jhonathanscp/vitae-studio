@@ -1,7 +1,5 @@
 import { CVData } from '../types/cv.model';
 
-export const CV_ENRICHMENT_API_URL = "http://localhost:3000"
-
 export const sampleData: CVData = {
   personal: {
     fullName: "Gabriel Silva Santos",

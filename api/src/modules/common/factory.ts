@@ -8,7 +8,7 @@ export function getClusterHolder(): ClusterHolder {
     if (clusterInstance === null) {
         clusterInstance = new ClusterHolder({
             headless: env.PUPPETEER_HEADLESS,
-            executablePath: env.PUPPETEER_EXECUTABLE_PATH,
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
             args: [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",

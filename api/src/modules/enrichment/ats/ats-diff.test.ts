@@ -16,7 +16,12 @@ import {
     curateCVWithOpenAICompatible,
     extractCVFromTextWithOpenAICompatible,
     extractJsonFromText,
-    extractRawContentFromChoice
+    extractRawContentFromChoice,
+    isReasoningModelName,
+    REASONING_MODEL_MAX_TOKENS,
+    STANDARD_MODEL_MAX_TOKENS,
+    getCompletionMaxTokens,
+    resolveFallbackMaxTokens
 } from "../ai/openai-compatible.provider";
 import {
     CURATION_SYSTEM_PROMPT_EN,
@@ -338,10 +343,11 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
     });
 
     describe("Full System Prompts Standards (Curation & Extraction)", () => {
-        it("verifies CURATION_SYSTEM_PROMPT_EN complies with English, Context Caching (>200 words), 1-page A4, Google XYZ, no-quotes and pt-BR", () => {
+        it("verifies CURATION_SYSTEM_PROMPT_EN complies with English, Context Caching (>200 words), _ats_mapping, 1-page A4, Google XYZ, no-quotes and pt-BR", () => {
             const wordCount = CURATION_SYSTEM_PROMPT_EN.split(/\s+/).filter(Boolean).length;
             expect(wordCount).toBeGreaterThan(200); // garante > 300 tokens
 
+            expect(CURATION_SYSTEM_PROMPT_EN).toContain("_ats_mapping");
             expect(CURATION_SYSTEM_PROMPT_EN).toContain("Google's XYZ Framework");
             expect(CURATION_SYSTEM_PROMPT_EN).toContain("Strict 1-Page A4 Budget");
             expect(CURATION_SYSTEM_PROMPT_EN).toContain("Brazilian Portuguese (pt-BR)");
@@ -362,7 +368,7 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
             expect(RESUME_EXTRACTION_SYSTEM_PROMPT_EN).toContain("original language (pt-BR)");
         });
 
-        it("curateCVWithOpenAICompatible sends immutable English system prompt, temperature 0.25 and safe max_tokens", async () => {
+        it("curateCVWithOpenAICompatible sends immutable English system prompt, temperature 0.3, max_tokens 8192, and strips _ats_mapping", async () => {
             let lastRequestBody: any = null;
 
             const server = http.createServer((req, res) => {
@@ -375,6 +381,12 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
                         choices: [{
                             message: {
                                 content: JSON.stringify({
+                                    _ats_mapping: {
+                                        target_role_core_duties: ["Arquitetura backend", "Escalabilidade"],
+                                        exact_ats_keywords: ["TypeScript", "Node.js"],
+                                        de_para_strategy: "Traduzir APIs para escala",
+                                        space_allocation_plan: "3 bullets + 1 projeto"
+                                    },
                                     matchScore: 92,
                                     matchedKeywords: ["TypeScript", "Node.js"],
                                     missingKeywords: ["AWS"],
@@ -414,15 +426,16 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
 
             expect(result.data).toBeDefined();
             expect(result.data?.matchScore).toBe(92);
+            expect((result.data as any)._ats_mapping).toBeUndefined();
             expect(lastRequestBody.messages[0].role).toBe("system");
             expect(lastRequestBody.messages[0].content).toContain("Principal Technical Recruiter");
-            expect(lastRequestBody.temperature).toBe(0.25);
-            expect(lastRequestBody.max_tokens).toBe(1400);
+            expect(lastRequestBody.temperature).toBe(0.3);
+            expect(lastRequestBody.max_tokens).toBe(8192);
 
             await new Promise<void>(resolve => server.close(() => resolve()));
         });
 
-        it("extractCVFromTextWithOpenAICompatible sends immutable English system prompt, temperature 0.1 and max_tokens 4000", async () => {
+        it("extractCVFromTextWithOpenAICompatible sends immutable English system prompt, temperature 0.1 and max_tokens 8192", async () => {
             let lastRequestBody: any = null;
 
             const server = http.createServer((req, res) => {
@@ -472,7 +485,7 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
             expect(lastRequestBody.messages[0].role).toBe("system");
             expect(lastRequestBody.messages[0].content).toContain("Senior People Analytics");
             expect(lastRequestBody.temperature).toBe(0.1);
-            expect(lastRequestBody.max_tokens).toBe(4000);
+            expect(lastRequestBody.max_tokens).toBe(8192);
 
             await new Promise<void>(resolve => server.close(() => resolve()));
         });
@@ -697,21 +710,424 @@ describe("ATS Optimization & DeepSeek Token Efficiency Suite", () => {
             expect(curated.tailoredObjective).not.toContain("`Docker`");
             expect(curated.tailoredObjective.endsWith(".")).toBe(true);
 
-            // BUG 3 Checks: experiências atualizadas mesmo com ID divergente, sem prefixos repetitivos e máx 3 bullets na principal
+            // BUG 3 Checks: experiências atualizadas mesmo com ID divergente, sem prefixos repetitivos e 3-4 bullets na principal
             const fhemigDesc = curated.experience["uuid-fhemig-991"].tailoredDescription || "";
             expect(fhemigDesc).not.toContain("Portal Institucional:");
             expect(fhemigDesc).not.toContain("Sistema de Catracas:");
             expect(fhemigDesc).not.toContain("'Node.js'");
             expect(fhemigDesc).toContain("Desenvolvi o portal e APIs em Node.js");
             const fhemigBullets = fhemigDesc.split("\n").filter(Boolean);
-            expect(fhemigBullets.length).toBeLessThanOrEqual(3);
+            expect(fhemigBullets.length).toBeLessThanOrEqual(4);
 
             const codeDesc = curated.experience["uuid-code-882"].tailoredDescription || "";
             expect(codeDesc).toContain("Desenvolvi APIs em Node.js");
             const codeBullets = codeDesc.split("\n").filter(Boolean);
-            expect(codeBullets.length).toBeLessThanOrEqual(2);
+            expect(codeBullets.length).toBeLessThanOrEqual(3);
 
             await new Promise<void>(resolve => server.close(() => resolve()));
+        });
+    });
+
+    describe("Reasoning Model Safeguards (deepseek-flash / reasoning_content)", () => {
+        it("detects reasoning/thinking models accurately via isReasoningModelName", () => {
+            expect(isReasoningModelName("deepseek-flash")).toBe(true);
+            expect(isReasoningModelName("deepseek-reasoner")).toBe(true);
+            expect(isReasoningModelName("deepseek-r1")).toBe(true);
+            expect(isReasoningModelName("o3-mini")).toBe(true);
+            expect(isReasoningModelName("gemini-2.5-flash")).toBe(true);
+
+            expect(isReasoningModelName("deepseek-chat")).toBe(false);
+            expect(isReasoningModelName("gpt-4o-mini")).toBe(false);
+        });
+
+        it("enrichCVWithOpenAICompatible sends max_tokens 20480 for deepseek-flash (6 experiences + 2 projects) and parses content alongside reasoning_content", async () => {
+            const richCV: CVData = {
+                ...sampleCV,
+                experience: Array.from({ length: 6 }, (_, i) => ({
+                    id: `exp-${i + 1}`,
+                    company: `Empresa ${i + 1}`,
+                    role: "Software Engineer",
+                    location: "Remoto",
+                    startDate: "01/2020",
+                    endDate: "12/2021",
+                    description: `Desenvolvimento de APIs e serviços críticos #${i + 1}.`
+                })),
+                projects: Array.from({ length: 2 }, (_, i) => ({
+                    id: `proj-${i + 1}`,
+                    name: `Projeto ${i + 1}`,
+                    role: "Autor",
+                    link: "github.com/carlossilva/proj",
+                    startDate: "2024",
+                    endDate: "",
+                    description: `Automação e pipeline de dados #${i + 1}.`
+                }))
+            };
+
+            let capturedBody: any = null;
+            const server = http.createServer((req, res) => {
+                let body = "";
+                req.on("data", chunk => { body += chunk; });
+                req.on("end", () => {
+                    capturedBody = JSON.parse(body);
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                reasoning_content: "We need to output JSON only, with diffs array for each id.",
+                                content: JSON.stringify({
+                                    diffs: [
+                                        {
+                                            id: "exp-1",
+                                            improved: "• Conquistou redução de 35% na latência das APIs, mensurado por Datadog, arquitetando microsserviços em Node.js e TypeScript."
+                                        }
+                                    ]
+                                })
+                            },
+                            finish_reason: "stop"
+                        }],
+                        usage: { prompt_tokens: 1703, completion_tokens: 950, total_tokens: 2653 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await enrichCVWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    rawHtml: "<section><h1>Senior Node.js Engineer</h1><p>Node.js TypeScript</p></section>",
+                    cv: richCV
+                });
+
+                expect(capturedBody.max_tokens).toBe(20480);
+                expect(result.err).toBeUndefined();
+                expect(result.data?.experience[0].description).toContain("Conquistou redução de 35%");
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
+        });
+
+        it("enrichCVWithOpenAICompatible returns clear token-limit error when deepseek-flash hits finish_reason length inside reasoning_content", async () => {
+            const server = http.createServer((req, res) => {
+                req.on("data", () => {});
+                req.on("end", () => {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                content: "",
+                                reasoning_content: "We need to output JSON only, with diffs array for each id. Need to rewrite bullets in pt-BR..."
+                            },
+                            finish_reason: "length"
+                        }],
+                        usage: { prompt_tokens: 1703, completion_tokens: 780, total_tokens: 2483 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await enrichCVWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    rawHtml: "<section><h1>Senior Node.js Engineer</h1></section>",
+                    cv: sampleCV
+                });
+
+                expect(result.err).toBeDefined();
+                expect(result.err?.message).toContain("limite de tokens");
+                expect(result.err?.message).toContain("deepseek-chat");
+                expect(result.err?.message).not.toContain("Unexpected token 'W'");
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
+        });
+
+        it("enrichCVWithOpenAICompatible returns clear reasoning error when proxy returns finish_reason stop with empty content and prose-only reasoning_content", async () => {
+            const server = http.createServer((req, res) => {
+                req.on("data", () => {});
+                req.on("end", () => {
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                content: "",
+                                reasoning_content: "We need to output JSON only, with diffs array for each id."
+                            },
+                            finish_reason: "stop"
+                        }],
+                        usage: { prompt_tokens: 1703, completion_tokens: 780, total_tokens: 2483 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await enrichCVWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    rawHtml: "<section><h1>Senior Node.js Engineer</h1></section>",
+                    cv: sampleCV
+                });
+
+                expect(result.err).toBeDefined();
+                expect(result.err?.message).toContain("raciocínio");
+                expect(result.err?.message).not.toContain("Unexpected token 'W'");
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
+        });
+
+        it("extractJsonFromText extracts last valid JSON object after brace placeholders and gives clear error for brace-free prose", () => {
+            const proseWithPlaceholders = `We need {placeholder} and {another} before returning:\n{"diffs":[{"id":"exp-1","improved":"• Conquistou 20% mais throughput"}]}`;
+            const parsed = extractJsonFromText(proseWithPlaceholders) as any;
+            expect(parsed.diffs).toHaveLength(1);
+            expect(parsed.diffs[0].id).toBe("exp-1");
+
+            const braceFreeProse = "We need to output JSON only, with diffs array for each id.";
+            expect(() => extractJsonFromText(braceFreeProse)).toThrowError(/sem objeto JSON válido/);
+            expect(() => extractJsonFromText(braceFreeProse)).not.toThrowError(/Unexpected token 'W'/);
+        });
+
+        it("extractCVFromTextWithOpenAICompatible sends max_tokens 20480 for deepseek-flash and handles finish_reason length gracefully", async () => {
+            let capturedBody: any = null;
+            const server = http.createServer((req, res) => {
+                let body = "";
+                req.on("data", chunk => { body += chunk; });
+                req.on("end", () => {
+                    capturedBody = JSON.parse(body);
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                content: "",
+                                reasoning_content: "Analyzing document structure..."
+                            },
+                            finish_reason: "length"
+                        }],
+                        usage: { prompt_tokens: 900, completion_tokens: 20480, total_tokens: 21380 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await extractCVFromTextWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    rawResumeText: "Carlos Silva - Desenvolvedor Node.js"
+                });
+
+                expect(capturedBody.max_tokens).toBe(20480);
+                expect(result.err).toBeDefined();
+                expect(result.err?.message).toContain("limite de tokens");
+                expect(result.err?.message).toContain("deepseek-chat");
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
+        });
+
+        it("getCompletionMaxTokens allocates 20480 (~20k) for reasoning models and 8192 for standard models", () => {
+            expect(REASONING_MODEL_MAX_TOKENS).toBe(20480);
+            expect(STANDARD_MODEL_MAX_TOKENS).toBe(8192);
+
+            expect(getCompletionMaxTokens("deepseek-flash")).toBe(20480);
+            expect(getCompletionMaxTokens("deepseek-reasoner")).toBe(20480);
+            expect(getCompletionMaxTokens("gemini-2.5-flash")).toBe(20480);
+
+            expect(getCompletionMaxTokens("deepseek-chat")).toBe(8192);
+            expect(getCompletionMaxTokens("gpt-4o-mini")).toBe(8192);
+        });
+
+        it("resolveFallbackMaxTokens extracts upper bounds from provider 400 error details or steps down safely", () => {
+            expect(
+                resolveFallbackMaxTokens(20480, "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]")
+            ).toBe(8192);
+            expect(
+                resolveFallbackMaxTokens(20480, "max_tokens must be at most 16384 for this model")
+            ).toBe(16384);
+            expect(
+                resolveFallbackMaxTokens(20480, "max_tokens (20480 > 8192) exceeds model limit")
+            ).toBe(8192);
+
+            expect(resolveFallbackMaxTokens(20480, "Invalid max_tokens value")).toBe(16384);
+            expect(resolveFallbackMaxTokens(16384, "Invalid max_tokens value")).toBe(8192);
+            expect(resolveFallbackMaxTokens(8192, "Invalid max_tokens value")).toBe(4096);
+            expect(resolveFallbackMaxTokens(4096, "Invalid max_tokens value")).toBeNull();
+        });
+
+        it("curateCVWithOpenAICompatible sends max_tokens 20480 for deepseek-flash", async () => {
+            let capturedBody: any = null;
+            const server = http.createServer((req, res) => {
+                let body = "";
+                req.on("data", chunk => { body += chunk; });
+                req.on("end", () => {
+                    capturedBody = JSON.parse(body);
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                reasoning_content: "Mapping target role keywords and allocating 1-page A4 budget...",
+                                content: JSON.stringify({
+                                    matchScore: 90,
+                                    matchedKeywords: ["Node.js", "TypeScript"],
+                                    missingKeywords: [],
+                                    tailoredObjective: "Engenheiro de software focado em APIs escaláveis.",
+                                    experienceCuration: [{
+                                        id: "exp-1",
+                                        included: true,
+                                        relevanceScore: 95,
+                                        tailoredDescription: "• Conquistou redução de 30% na latência de APIs em Node.js."
+                                    }],
+                                    projectCuration: [],
+                                    educationCuration: [{ id: "edu-1", included: true, relevanceScore: 90 }],
+                                    certificateCuration: [],
+                                    selectedSkills: ["Node.js", "TypeScript"]
+                                })
+                            },
+                            finish_reason: "stop"
+                        }],
+                        usage: { prompt_tokens: 1200, completion_tokens: 1850, total_tokens: 3050 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await curateCVWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    cv: sampleCV,
+                    job: { roleTitle: "Backend Engineer", jobDescription: "Node.js e TypeScript" }
+                });
+
+                expect(capturedBody.max_tokens).toBe(20480);
+                expect(result.err).toBeUndefined();
+                expect(result.data?.matchScore).toBe(90);
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
+        });
+
+        it("enrichCVWithOpenAICompatible retries with lower max_tokens (preserving response_format) when provider returns HTTP 400 max_tokens range error", async () => {
+            const receivedBodies: any[] = [];
+            const server = http.createServer((req, res) => {
+                let body = "";
+                req.on("data", chunk => { body += chunk; });
+                req.on("end", () => {
+                    const parsedReq = JSON.parse(body);
+                    receivedBodies.push(parsedReq);
+
+                    if (receivedBodies.length === 1) {
+                        res.writeHead(400, { "Content-Type": "application/json" });
+                        res.end(JSON.stringify({
+                            error: {
+                                message: "Invalid max_tokens value, the valid range of max_tokens is [1, 8192]",
+                                type: "invalid_request_error",
+                                param: "max_tokens"
+                            }
+                        }));
+                        return;
+                    }
+
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({
+                        choices: [{
+                            message: {
+                                role: "assistant",
+                                content: JSON.stringify({
+                                    diffs: [
+                                        {
+                                            id: "exp-1",
+                                            improved: "• Elevou a disponibilidade do gateway de pagamentos em 99,95%, mensurado via Prometheus, reestruturando serviços em Node.js."
+                                        }
+                                    ]
+                                })
+                            },
+                            finish_reason: "stop"
+                        }],
+                        usage: { prompt_tokens: 900, completion_tokens: 450, total_tokens: 1350 }
+                    }));
+                });
+            });
+
+            let port = 0;
+            await new Promise<void>(resolve => {
+                server.listen(0, "127.0.0.1", () => {
+                    const addr = server.address();
+                    if (addr && typeof addr === "object") port = addr.port;
+                    resolve();
+                });
+            });
+
+            try {
+                const result = await enrichCVWithOpenAICompatible({
+                    baseUrl: `http://127.0.0.1:${port}`,
+                    apiKey: "sk-mock-key",
+                    model: "deepseek-flash",
+                    rawHtml: "<section><h1>Backend Engineer</h1><p>Node.js</p></section>",
+                    cv: sampleCV
+                });
+
+                expect(receivedBodies).toHaveLength(2);
+                expect(receivedBodies[0].max_tokens).toBe(20480);
+                expect(receivedBodies[1].max_tokens).toBe(8192);
+                expect(receivedBodies[1].response_format).toEqual({ type: "json_object" });
+                expect(result.err).toBeUndefined();
+                expect(result.data?.experience[0].description).toContain("Elevou a disponibilidade");
+            } finally {
+                await new Promise<void>(resolve => server.close(() => resolve()));
+            }
         });
     });
 });

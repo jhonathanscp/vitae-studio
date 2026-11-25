@@ -23,8 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 
-package-lock.json
 yarn.lock
 cookies.json
 
 **/.agents/
+docker-compose.override.yml

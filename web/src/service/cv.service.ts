@@ -1,7 +1,10 @@
 import axios, { isAxiosError } from "axios"
 import { CVData, TargetedCuration } from "../types/cv.model"
 
-export const CV_ENRICHMENT_API_URL = import.meta.env.VITE_API_URL || "http://localhost:3000"
+const rawApiUrl = (import.meta.env.VITE_API_URL || "").trim();
+export const CV_ENRICHMENT_API_URL = (
+    rawApiUrl || (import.meta.env.DEV ? "http://localhost:3000" : "/api")
+).replace(/\/+$/, "");
 
 const client = axios.create({
     baseURL: CV_ENRICHMENT_API_URL,
